@@ -16,10 +16,11 @@ CLUSTER_CONFIG = {
     4: {"type": "pivot", "levels": [0, 1, 2], "prefix": "promo_category_level"},
     5: {"type": "pivot", "levels": [0, 1], "prefix": "store_format_level"},
     6: {"type": "simple", "alias": "delivery_group_uid"},
+    7: {"type": "simple", "alias": "selection_type_value"},
+    8: {"type": "simple", "alias": "promo_inout_value"},
 }
 #working tables
 property_norm_table = 'property_norm'
-property_priority_table= 'property_priority'
 property_table='property'
 cluster_table='cluster'
 
@@ -57,16 +58,11 @@ def main():
     logger.info("Reading source tables from database...")
     property_df = read_jdbc_data(spark=spark,table_name= property_table)
     cluster_df = read_jdbc_data(spark=spark,table_name= cluster_table)
-    property_priority_df = read_jdbc_data(spark=spark, table_name= property_priority_table)
 
     processed_cluster_dfs = _process_cluster_data(cluster_df, CLUSTER_CONFIG)
 
     logger.info("Joining all processed DataFrames...")
-    base_df = property_df.alias("p").join(
-        property_priority_df.alias("pp"),
-        F.col("p.id") == F.col("pp.property_id"),
-        "left"
-    )
+    base_df = property_df.alias("p")
     
     final_df = reduce(
         lambda df, next_df: df.join(next_df, F.col("p.id") == next_df.property_id, "left"),
@@ -90,7 +86,7 @@ def main():
         "p.start_date",
         "p.end_date",
         "p.is_exception",
-        F.when(F.col("p.is_exception"), 0).otherwise(F.col("pp.order_number")).alias("order_number"),
+        F.when(F.col("p.is_exception"), F.lit(0)).otherwise(F.lit(None).cast("integer")).alias("order_number"),
     ]
     
     for col_name in new_uid_columns:

@@ -1,3 +1,5 @@
+from typing import List, Optional
+
 from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql.types import LongType, IntegerType
 import pyspark.sql.functions as F
@@ -5,6 +7,13 @@ import os
 import logging
 from jdbs_db_utils import write_jdbc_data,read_jdbc_data
 from spark_utils import create_spark_session
+from priority_utils import (
+    attach_priority_info,
+    required_priority_columns,
+    resolve_priority_columns,
+    filter_by_selection_type,
+    filter_by_promo_inout,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -18,9 +27,12 @@ supplier_location_period = "supplier_location_period"
 
 condition = "condition"
 unit = "unit"
+metric_cluster_link_table = "metric_cluster_link"
 #working tables
 result_supplier_location_period='result_supplier_location_period'
 
+
+PRIORITY_COLUMN_CANDIDATES = required_priority_columns()
 
 
 
@@ -37,7 +49,8 @@ def extract_data_for_procedure(spark: SparkSession):
         "supplier_location_period_norm": read_jdbc_data(supplier_location_period_norm, spark),
         "supplier_location_period": read_jdbc_data(supplier_location_period, spark),
         "condition": read_jdbc_data(condition, spark),
-        "unit": read_jdbc_data(unit, spark)
+        "unit": read_jdbc_data(unit, spark),
+        "metric_cluster_link": read_jdbc_data(metric_cluster_link_table, spark),
     }
 
     return dfs
@@ -46,7 +59,10 @@ def extract_data_for_procedure(spark: SparkSession):
 def find_intersections(
         supplier_location_period_norm_df: DataFrame,
         property_norm_df: DataFrame,
-        metric_id: int
+        metric_id: int,
+        *,
+        item_df: Optional[DataFrame] = None,
+        item_promo_df: Optional[DataFrame] = None,
 ) -> DataFrame:
     """
     Finds all valid intersections between scope data и properties.
@@ -73,24 +89,34 @@ def find_intersections(
                 F.coalesce(F.col(f"scope.{col_name}"), F.lit(0))
         )
 
-    intersections_df = scope.join(
-        prop,
-        join_condition,
-        "inner"
-    ).select(
+    property_columns = property_norm_df.columns
+    priority_select_cols = [col for col in PRIORITY_COLUMN_CANDIDATES if col in property_columns]
+
+    select_cols = [
         F.col("scope.location_id"),
         F.col("scope.supplier_id"),
         F.greatest(F.col("prop.start_date"), F.col("scope.begin_dt")).alias("begin_dt"),
         F.least(F.col("prop.end_date"), F.col("scope.end_dt")).alias("end_dt"),
         F.col("prop.property_id"),
         F.col("prop.is_exception"),
-        F.col("prop.order_number")
-    )
+    ]
+
+    for col_name in priority_select_cols:
+        select_cols.append(F.col(f"prop.{col_name}").alias(col_name))
+
+    intersections_df = scope.join(
+        prop,
+        join_condition,
+        "inner"
+    ).select(*select_cols)
+
+    intersections_df = filter_by_selection_type(intersections_df, item_df=item_df)
+    intersections_df = filter_by_promo_inout(intersections_df, item_promo_df=item_promo_df)
 
     return intersections_df
 
 
-def calculate_final_periods(intersections_df: DataFrame) -> DataFrame:
+def calculate_final_periods(intersections_df: DataFrame, priority_columns: List[str]) -> DataFrame:
     """
     Does date period slicing based on priorities.
     This function is PySpark-version of SQL function fnc_get_period and
@@ -99,7 +125,13 @@ def calculate_final_periods(intersections_df: DataFrame) -> DataFrame:
 
     scope_pk_cols = ["location_id", "supplier_id"]
 
-    event_points_df = intersections_df.select(
+    prioritized_df = attach_priority_info(
+        intersections_df,
+        partition_cols=scope_pk_cols,
+        priority_columns=priority_columns,
+    )
+
+    event_points_df = prioritized_df.select(
         *scope_pk_cols,
         F.array(
             F.col("begin_dt"),
@@ -119,7 +151,7 @@ def calculate_final_periods(intersections_df: DataFrame) -> DataFrame:
     ).dropna(subset=["interval_end"])
 
     interval_props_df = intervals_df.join(
-        intersections_df,
+        prioritized_df,
         scope_pk_cols
     ).filter(
         (F.col("interval_start") <= F.col("end_dt")) &
@@ -127,7 +159,11 @@ def calculate_final_periods(intersections_df: DataFrame) -> DataFrame:
     )
 
     win_spec = Window.partitionBy(*scope_pk_cols, "interval_start") \
-        .orderBy(F.col("is_exception").desc(), F.col("order_number").asc())
+        .orderBy(
+            F.col("is_exception").desc(),
+            F.col("priority_array"),
+            F.col("property_id"),
+        )
 
     best_prop_df = interval_props_df.withColumn("rn", F.row_number().over(win_spec)).filter(F.col("rn") == 1)
 
@@ -149,7 +185,7 @@ def calculate_final_periods(intersections_df: DataFrame) -> DataFrame:
         "order_number"
     ).orderBy(*scope_pk_cols, "begin_dt")
 
-    return final_periods_df
+    return final_periods_df.drop("priority_array")
 
 
 def calculate_gaps(final_periods_df: DataFrame, original_scope_df: DataFrame) -> DataFrame:
@@ -282,6 +318,16 @@ def main(current_metric_id):
 
     dfs = extract_data_for_procedure(spark)
 
+    metric_priority_df = dfs.pop("metric_cluster_link")
+    metric_priority_rows = (
+        metric_priority_df
+        .filter(F.col("metric_id") == current_metric_id)
+        .orderBy("order_number")
+        .select("cluster_type_id", "cluster_type_level")
+        .collect()
+    )
+    priority_columns = resolve_priority_columns(metric_priority_rows)
+
     intersections_df = find_intersections(
         supplier_location_period_norm_df=dfs["supplier_location_period_norm"],
         property_norm_df=dfs["property_norm"],
@@ -290,7 +336,7 @@ def main(current_metric_id):
 
     print("INFO: Step 3 results: Found intersections")
 
-    final_periods_df = calculate_final_periods(intersections_df)
+    final_periods_df = calculate_final_periods(intersections_df, priority_columns)
     print("INFO: Step 4 results: Final period after slicing and gluing")
 
     gaps_df = calculate_gaps(final_periods_df, dfs["supplier_location_period"])
