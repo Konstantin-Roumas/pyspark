@@ -172,9 +172,22 @@ def filter_by_selection_type(
     if item_df is None or item_id_col not in dataframe.columns:
         return dataframe
 
+    type_column = None
+    if item_type_col in item_df.columns:
+        type_column = item_type_col
+    elif "item_type_uid" in item_df.columns:
+        type_column = "item_type_uid"
+
+    if type_column is None or item_key_col not in item_df.columns:
+        logger.warning(
+            "Skipping SELECTION_TYPE filter because required item columns are missing: %s",
+            item_df.columns,
+        )
+        return dataframe
+
     lookup_df = item_df.select(
         F.col(item_key_col).alias("__selection_item_uid"),
-        F.col(item_type_col).alias("__selection_item_type"),
+        F.col(type_column).alias("__selection_item_type"),
     )
 
     df = dataframe.join(
